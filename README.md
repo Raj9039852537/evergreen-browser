@@ -204,6 +204,7 @@ node scripts\visual_e2e_playwright.js
 ---
 
 ## Documentation
+- [Userscript support and `GM_xmlhttpRequest`](docs/userscripts.md)
 
 - **[Architecture Specification](docs/architecture.md)**: Process hierarchy, multi-child HWND composition, and tab sleep lifecycle.
 - **[Performance Benchmarks](docs/benchmarks.md)**: Empirical measurements, per-process memory breakdowns, and verification steps.

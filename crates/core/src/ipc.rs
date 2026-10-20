@@ -5,6 +5,16 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "action", content = "payload")]
 pub enum UiToHostMessage {
+    /// Native HTTP request made by a userscript through GM_xmlhttpRequest.
+    UserscriptHttpRequest {
+        tab_id: TabId,
+        request_id: String,
+        token: String,
+        url: String,
+        method: String,
+        headers: serde_json::Value,
+        body: Option<String>,
+    },
     /// Emitted when the chrome UI has finished loading and is ready for initial state
     ChromeReady,
     /// Request creating a new tab

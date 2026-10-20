@@ -8,6 +8,7 @@ mod home_ui;
 mod settings_ui;
 mod sidebar_ui;
 mod window;
+mod userscripts;
 
 use chrome::{create_bounds, get_chrome_html, normalize_url, CHROME_HEIGHT};
 use evergreen_core::env::{detect_webview2_runtime, is_process_elevated};
@@ -121,6 +122,12 @@ pub(crate) enum BrowserEvent {
         tab_id: TabId,
         request_uri: String,
         error_status: i32,
+    },
+    UserscriptHttpResponse {
+        window_id: WindowId,
+        tab_id: TabId,
+        request_id: String,
+        response_json: String,
     },
 }
 
@@ -480,6 +487,28 @@ fn get_settings_path() -> std::path::PathBuf {
     get_data_directory().join("settings.json")
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+struct SessionSnapshot {
+    version: u32,
+    tabs: Vec<String>,
+    active_index: usize,
+}
+
+fn get_session_path() -> std::path::PathBuf {
+    get_data_directory().join("session.json")
+}
+
+fn load_session_snapshot() -> Option<SessionSnapshot> {
+    let data = std::fs::read(get_session_path()).ok()?;
+    let snapshot: SessionSnapshot = serde_json::from_slice(&data).ok()?;
+    if snapshot.version != 1 { return None; }
+    let tabs: Vec<String> = snapshot.tabs.into_iter()
+        .filter(|url| !url.trim().is_empty() && !url.starts_with("data:"))
+        .collect();
+    if tabs.is_empty() { return None; }
+    Some(SessionSnapshot { version: 1, active_index: snapshot.active_index.min(tabs.len() - 1), tabs })
+}
+
 struct BrowserApp {
     windows: HashMap<WindowId, WindowContext>,
     proxy: EventLoopProxy<BrowserEvent>,
@@ -490,6 +519,10 @@ struct BrowserApp {
     plugins: evergreen_core::plugins::PluginRegistry,
     next_tab_id: AtomicU64,
     allowed_cert_hosts: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    startup_session: Option<SessionSnapshot>,
+    suppress_session_save: bool,
+    userscripts: Vec<userscripts::UserScript>,
+    userscript_secret: u128,
 }
 
 impl BrowserApp {
@@ -497,6 +530,9 @@ impl BrowserApp {
         let settings_path = get_settings_path();
         let settings =
             evergreen_core::settings::Settings::load_from_path(&settings_path).unwrap_or_default();
+        let args: Vec<String> = std::env::args().collect();
+        let explicit_startup_url = args.iter().skip(1).any(|a| !a.is_empty() && !a.starts_with('-'));
+        let startup_session = if explicit_startup_url { None } else { load_session_snapshot() };
         let mut plugins = evergreen_core::plugins::PluginRegistry::new();
         plugins.register(evergreen_core::plugins::FeaturePlugin::new(
             evergreen_core::plugins::PluginMetadata {
@@ -582,6 +618,10 @@ impl BrowserApp {
             plugins,
             next_tab_id: AtomicU64::new(1),
             allowed_cert_hosts: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            startup_session,
+            suppress_session_save: false,
+            userscripts: userscripts::load_from_directory(&get_data_directory().join("userscripts")),
+            userscript_secret: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() ^ ((std::process::id() as u128) << 64),
         }
     }
 
@@ -590,6 +630,30 @@ impl BrowserApp {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs()
+    }
+
+    fn save_session(&self, win_id: WindowId) {
+        if self.suppress_session_save { return; }
+        let Some(win) = self.windows.get(&win_id) else { return; };
+        let tabs = win.tab_manager.tabs();
+        let urls: Vec<String> = tabs.iter().map(|t| t.url.clone()).collect();
+        if urls.iter().all(|u| u.trim().is_empty() || u == "about:blank") {
+            let _ = std::fs::remove_file(get_session_path());
+            return;
+        }
+        let active_index = win.tab_manager.active_tab_id()
+            .and_then(|id| tabs.iter().position(|t| t.id == id)).unwrap_or(0);
+        let snapshot = SessionSnapshot { version: 1, tabs: urls, active_index };
+        let path = get_session_path();
+        if let Some(parent) = path.parent() { let _ = std::fs::create_dir_all(parent); }
+        if let Ok(bytes) = serde_json::to_vec_pretty(&snapshot) {
+            let temp = path.with_extension("json.tmp");
+            if std::fs::write(&temp, bytes).is_ok() {
+                // Windows rename does not replace an existing destination.
+                let _ = std::fs::remove_file(&path);
+                let _ = std::fs::rename(temp, path);
+            }
+        }
     }
 
     fn next_tab_id(&self) -> TabId {
@@ -718,12 +782,28 @@ impl BrowserApp {
         // Sidebar webview is lazily instantiated on demand in open_sidebar()
         self.windows.insert(win_id, win_ctx);
 
-        let target_url = initial_url.or_else(|| {
-            std::env::args()
-                .nth(1)
-                .filter(|a| !a.is_empty() && !a.starts_with('-'))
+        let cli_url = initial_url.or_else(|| {
+            std::env::args().skip(1).find(|a| !a.is_empty() && !a.starts_with('-'))
         });
-        self.handle_create_tab(win_id, target_url);
+        if let Some(url) = cli_url {
+            self.handle_create_tab(win_id, Some(url));
+        } else if let Some(snapshot) = self.startup_session.take() {
+            self.suppress_session_save = true;
+            let mut restored_ids = Vec::new();
+            for url in snapshot.tabs {
+                self.handle_create_tab(win_id, Some(url));
+                if let Some(win) = self.windows.get(&win_id) {
+                    if let Some(active) = win.tab_manager.active_tab_id() { restored_ids.push(active); }
+                }
+            }
+            if let Some(id) = restored_ids.get(snapshot.active_index).copied() {
+                if let Some(win) = self.windows.get_mut(&win_id) { win.handle_switch_tab(id, &self.cert_cache); }
+            }
+            self.suppress_session_save = false;
+            self.save_session(win_id);
+        } else {
+            self.handle_create_tab(win_id, None);
+        }
 
         window.set_visible(true);
         Some(win_id)
@@ -762,11 +842,9 @@ impl BrowserApp {
         let is_settings = url.starts_with("evergreen://settings");
 
         let plugin_scripts = self.plugins.combined_content_scripts(&self.settings);
-        let init_script = if plugin_scripts.is_empty() {
-            NAV_WATCHER_SCRIPT.to_string()
-        } else {
-            format!("{}\n{}", NAV_WATCHER_SCRIPT, plugin_scripts)
-        };
+        let userscript_token = format!("{:032x}", self.userscript_secret ^ (tab_id.0 as u128).rotate_left(29) ^ (format!("{:?}", win_id).bytes().fold(0u128, |a, b| a.wrapping_mul(131).wrapping_add(b as u128))));
+        let userscript_bundle = userscripts::build_initialization_script(&self.userscripts, &userscript_token);
+        let init_script = format!("{}\n{}\n{}", NAV_WATCHER_SCRIPT, plugin_scripts, userscript_bundle);
 
         let is_persistent = self.settings.is_site_persistent(url);
         let settings_nav = self.settings.clone();
@@ -855,8 +933,21 @@ impl BrowserApp {
                 true
             })
             .with_ipc_handler(move |req: wry::http::Request<String>| {
-                if let Ok(msg) = serde_json::from_str::<UiToHostMessage>(req.body()) {
-                    let _ = proxy_ipc.send_event(BrowserEvent::Ipc(win_id, msg));
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(req.body()) {
+                    if value.get("action").and_then(|v| v.as_str()) == Some("UserscriptHttpRequest") {
+                        let payload = value.get("payload").cloned().unwrap_or_default();
+                        let request_id = payload.get("request_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let token = payload.get("token").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let url = payload.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let method = payload.get("method").and_then(|v| v.as_str()).unwrap_or("GET").to_string();
+                        let headers = payload.get("headers").cloned().unwrap_or_else(|| serde_json::json!({}));
+                        let body = payload.get("data").and_then(|v| v.as_str()).map(str::to_string);
+                        let _ = proxy_ipc.send_event(BrowserEvent::Ipc(win_id, UiToHostMessage::UserscriptHttpRequest {
+                            tab_id, request_id, token, url, method, headers, body
+                        }));
+                    } else if let Ok(msg) = serde_json::from_value::<UiToHostMessage>(value) {
+                        let _ = proxy_ipc.send_event(BrowserEvent::Ipc(win_id, msg));
+                    }
                 }
             })
             .build_as_child(window)?;
@@ -935,6 +1026,7 @@ impl BrowserApp {
                             win_ctx.sync_zoom(1.0);
                         }
                     }
+                    self.save_session(win_id);
                 }
                 Err(e) => eprintln!("Failed to create tab webview: {:?}", e),
             }
@@ -982,8 +1074,10 @@ impl BrowserApp {
             false
         };
 
+        if !should_close_window { self.save_session(win_id); }
         if should_close_window {
             self.windows.remove(&win_id);
+            let _ = std::fs::remove_file(get_session_path());
             if self.windows.is_empty() {
                 event_loop.exit();
             }
@@ -1153,6 +1247,7 @@ impl BrowserApp {
                         }
                     }
                 }
+                self.save_session(win_id);
             }
             Err(err) => eprintln!("Navigation error: {}", err),
         }
@@ -1249,6 +1344,26 @@ impl ApplicationHandler<BrowserEvent> for BrowserApp {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: BrowserEvent) {
         match event {
             BrowserEvent::Ipc(win_id, action) => match action {
+                UiToHostMessage::UserscriptHttpRequest { tab_id, request_id, token, url, method, headers, body } => {
+                    let expected_token = format!("{:032x}", self.userscript_secret ^ (tab_id.0 as u128).rotate_left(29) ^ (format!("{:?}", win_id).bytes().fold(0u128, |a, b| a.wrapping_mul(131).wrapping_add(b as u128))));
+                    let page_url = self.windows.get(&win_id)
+                        .and_then(|w| w.tab_manager.tabs().iter().find(|t| t.id == tab_id).map(|t| t.url.clone()))
+                        .unwrap_or_default();
+                    let allowed = userscripts::allowed_connect_hosts(&self.userscripts, &page_url);
+                    if token != expected_token || !userscripts::is_connect_allowed(&url, &allowed) {
+                        let response = serde_json::json!({"status": 0, "statusText": "Blocked by userscript bridge token or @connect policy", "responseText": "", "responseHeaders": ""}).to_string();
+                        if let Some(wv) = self.windows.get(&win_id).and_then(|w| w.tabs.get(&tab_id)) {
+                            let js = format!("window.__egUserscriptHttpResponse && window.__egUserscriptHttpResponse({}, {});", serde_json::to_string(&request_id).unwrap_or_else(|_| "\"\"".into()), serde_json::to_string(&response).unwrap_or_else(|_| "\"{}\"".into()));
+                            let _ = wv.evaluate_script(&js);
+                        }
+                    } else {
+                        let proxy = self.proxy.clone();
+                        std::thread::spawn(move || {
+                            let response_json = userscripts::perform_http_request(&url, &method, &headers, body.as_deref());
+                            let _ = proxy.send_event(BrowserEvent::UserscriptHttpResponse { window_id: win_id, tab_id, request_id, response_json });
+                        });
+                    }
+                }
                 UiToHostMessage::ChromeReady => {
                     if let Some(win) = self.windows.get(&win_id) {
                         win.sync_ui_state();
@@ -1264,6 +1379,7 @@ impl ApplicationHandler<BrowserEvent> for BrowserApp {
                     if let Some(win) = self.windows.get_mut(&win_id) {
                         win.handle_switch_tab(id, &self.cert_cache);
                     }
+                    self.save_session(win_id);
                 }
                 UiToHostMessage::CloseTab { id } => {
                     self.handle_close_tab(win_id, id, event_loop);
@@ -1381,6 +1497,7 @@ impl ApplicationHandler<BrowserEvent> for BrowserApp {
                             win.update_sidebar_sync(&self.cert_cache);
                         }
                     }
+                    self.save_session(win_id);
                 }
                 UiToHostMessage::OpenDevTools => {
                     if let Some(win) = self.windows.get(&win_id) {
@@ -1418,6 +1535,7 @@ impl ApplicationHandler<BrowserEvent> for BrowserApp {
                         win.tab_manager.reorder_tab(from_index, to_index);
                         win.sync_ui_state();
                     }
+                    self.save_session(win_id);
                 }
                 UiToHostMessage::DetachTabToNewWindow {
                     tab_id,
@@ -1717,6 +1835,13 @@ impl ApplicationHandler<BrowserEvent> for BrowserApp {
                         );
                         let _ = wv.load_url(&crash_banner_html);
                     }
+                }
+            }
+            BrowserEvent::UserscriptHttpResponse { window_id, tab_id, request_id, response_json } => {
+                if let Some(wv) = self.windows.get(&window_id).and_then(|w| w.tabs.get(&tab_id)) {
+                    let id_js = serde_json::to_string(&request_id).unwrap_or_else(|_| "\"\"".into());
+                    let response_js = serde_json::to_string(&response_json).unwrap_or_else(|_| "\"{}\"".into());
+                    let _ = wv.evaluate_script(&format!("window.__egUserscriptHttpResponse && window.__egUserscriptHttpResponse({}, {});", id_js, response_js));
                 }
             }
             BrowserEvent::ServerCertificateError {
