@@ -161,7 +161,7 @@ for (const item of __egScripts) {{
   const sandbox = {{ console, setTimeout, clearTimeout, setInterval, clearInterval, URL, URLSearchParams }};
   if (grants.has('GM_xmlhttpRequest') || grants.has('GM.xmlHttpRequest')) sandbox.GM_xmlhttpRequest = __egGM.GM_xmlhttpRequest;
   if (grants.has('GM.xmlHttpRequest')) sandbox.GM = {{xmlHttpRequest: __egGM.GM_xmlhttpRequest}};
-  try {{ (new Function('window','document','location','GM_xmlhttpRequest','GM','unsafeWindow', item.source + '\\n//# sourceURL=userscript://' + encodeURIComponent(item.name)))(window,document,location,sandbox.GM_xmlhttpRequest,sandbox.GM,window); }}
+  try {{ (new Function('window','document','location','GM_xmlhttpRequest','GM','unsafeWindow', item.source + '\n//# sourceURL=userscript://' + encodeURIComponent(item.name)))(window,document,location,sandbox.GM_xmlhttpRequest,sandbox.GM,window); }}
   catch (e) {{ console.error('[Evergreen userscript]', item.name, e); }}
 }}
 }})();"#)
