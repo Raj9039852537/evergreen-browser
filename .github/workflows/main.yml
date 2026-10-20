@@ -13,11 +13,16 @@ on:
   workflow_dispatch:
     inputs:
       publish_release:
-        description: "Publish a GitHub Release (only works on a version tag)"
+        description: "Publish a GitHub Release"
         required: false
         type: boolean
         default: false
 
+      version_tag:
+        description: "Release tag (e.g. v1.0.0)"
+        required: false
+        type: string
+        default: ""
 permissions:
   contents: read
 
@@ -82,3 +87,22 @@ jobs:
           path: artifacts/evergreen-browser-windows-x64.exe
           if-no-files-found: error
           retention-days: 14
+      
+      - name: Validate and create release tag
+        if: inputs.publish_release
+        shell: pwsh
+        env:
+          VERSION_TAG: ${{ inputs.version_tag }}
+        run: |
+          if ($env:VERSION_TAG -notmatch '^v\d+\.\d+\.\d+([-.][0-9A-Za-z.-]+)?$') {
+            throw "Invalid version tag: $env:VERSION_TAG"
+          }
+           git tag $env:VERSION_TAG
+          git push origin $env:VERSION_TAG
+       - name: Publish GitHub Release
+        if: inputs.publish_release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.version_tag }}
+          files: release/evergreen-browser.exe
+          generate_release_notes: true
