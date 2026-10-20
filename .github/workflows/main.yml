@@ -1,0 +1,120 @@
+name: Windows Build and Release
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - "v*"
+
+  pull_request:
+
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: "Publish a GitHub Release (only works on a version tag)"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build Windows x64 EXE
+    runs-on: windows-2022
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable MSVC
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable-x86_64-pc-windows-msvc
+          components: clippy
+
+      - name: Configure MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verify toolchain
+        shell: pwsh
+        run: |
+          rustc --version
+          cargo --version
+          where.exe link
+          where.exe rc
+
+      - name: Run workspace tests
+        run: cargo test --workspace
+
+      - name: Run Clippy
+        run: cargo clippy --workspace -- -D warnings
+
+      - name: Build release EXE
+        run: cargo build --release -p evergreen-browser
+
+      - name: Stage executable
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $exe = "target/release/evergreen-browser.exe"
+
+          if (!(Test-Path $exe)) {
+            throw "Executable not found: $exe. Check the package's binary target name."
+          }
+
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+          Copy-Item $exe "artifacts/evergreen-browser-windows-x64.exe"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: evergreen-browser-windows-x64
+          path: artifacts/evergreen-browser-windows-x64.exe
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    if: >-
+      startsWith(github.ref, 'refs/tags/v') &&
+      (
+        github.event_name == 'push' ||
+        inputs.publish_release == true
+      )
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download executable artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: evergreen-browser-windows-x64
+          path: release-files
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          gh release create "$TAG" \
+            release-files/evergreen-browser-windows-x64.exe \
+            --repo "$REPO" \
+            --title "$TAG" \
+            --generate-notes
