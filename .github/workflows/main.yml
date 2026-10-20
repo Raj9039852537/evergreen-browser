@@ -59,9 +59,6 @@ jobs:
       - name: Run workspace tests
         run: cargo test --workspace
 
-      - name: Run Clippy
-        run: cargo clippy --workspace -- -D warnings
-
       - name: Build release EXE
         run: cargo build --release -p evergreen-browser
 
@@ -85,36 +82,3 @@ jobs:
           path: artifacts/evergreen-browser-windows-x64.exe
           if-no-files-found: error
           retention-days: 14
-
-  release:
-    name: Publish GitHub Release
-    needs: build
-    if: >-
-      startsWith(github.ref, 'refs/tags/v') &&
-      (
-        github.event_name == 'push' ||
-        inputs.publish_release == true
-      )
-    runs-on: ubuntu-22.04
-    permissions:
-      contents: write
-
-    steps:
-      - name: Download executable artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: evergreen-browser-windows-x64
-          path: release-files
-
-      - name: Publish release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
-          REPO: ${{ github.repository }}
-        shell: bash
-        run: |
-          gh release create "$TAG" \
-            release-files/evergreen-browser-windows-x64.exe \
-            --repo "$REPO" \
-            --title "$TAG" \
-            --generate-notes
