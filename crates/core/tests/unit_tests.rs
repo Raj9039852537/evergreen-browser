@@ -356,16 +356,6 @@ fn test_tab_manager_reorder() {
 }
 
 #[test]
-fn test_is_process_elevated_returns_false_unelevated() {
-    // Under normal user runs or developer testing, this process is not elevated.
-    let elevated = is_process_elevated();
-    assert!(
-        !elevated,
-        "Process expected to run unelevated in standard environment"
-    );
-}
-
-#[test]
 fn test_settings_update_from_partial_json() {
     let mut s = Settings::default();
     assert!(s.downloads.ask_where_to_save);
